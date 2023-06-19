@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::sync::{Barrier, watch};
 
 pub mod cdc;
 mod consts;
@@ -33,12 +34,27 @@ pub use util::*;
 /// Main struct of a USB/IP server
 pub struct UsbIpServer {
     devices: Vec<UsbDevice>,
+    control_barrier: Barrier,
+    control_channel: (watch::Sender<bool>, watch::Receiver<bool>),
+}
+
+impl Default for UsbIpServer {
+    fn default() -> Self {
+        Self {
+            devices: vec![],
+            control_barrier: Barrier::new(1),
+            control_channel: watch::channel(false),
+        }
+    }
 }
 
 impl UsbIpServer {
-    /// Create a [UsbIpServer] with simulated devices
+    /// Create a [`UsbIpServer`] with simulated devices
     pub fn new_simulated(devices: Vec<UsbDevice>) -> Self {
-        Self { devices }
+        Self {
+            devices,
+            ..Default::default()
+        }
     }
 
     fn with_devices(device_list: Vec<Device<GlobalContext>>) -> Vec<UsbDevice> {
@@ -171,7 +187,7 @@ impl UsbIpServer {
         devices
     }
 
-    /// Create a [UsbIpServer] exposing devices in the host, and redirect all USB transfers to them using libusb
+    /// Create a [`UsbIpServer`] exposing devices in the host, and redirect all USB transfers to them using libusb
     pub fn new_from_host() -> Self {
         match rusb::devices() {
             Ok(list) => {
@@ -179,11 +195,14 @@ impl UsbIpServer {
                 for d in list.iter() {
                     devs.push(d)
                 }
+                let device_count = devs.len();
                 Self {
                     devices: Self::with_devices(devs),
+                    control_barrier: Barrier::new(device_count + 1),
+                    ..Default::default()
                 }
             }
-            Err(_) => Self { devices: vec![] },
+            Err(_) => Default::default(),
         }
     }
 
@@ -197,168 +216,211 @@ impl UsbIpServer {
                 for d in list.iter().filter(filter) {
                     devs.push(d)
                 }
+                let device_count = devs.len();
                 Self {
                     devices: Self::with_devices(devs),
+                    control_barrier: Barrier::new(device_count + 1),
+                    ..Default::default()
                 }
             }
-            Err(_) => Self { devices: vec![] },
+            Err(_) => Default::default(),
         }
     }
-}
 
-async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
-    mut socket: &mut T,
-    server: Arc<UsbIpServer>,
-) -> Result<()> {
-    let mut current_import_device = None;
-    loop {
-        let mut command = [0u8; 4];
-        if let Err(err) = socket.read_exact(&mut command).await {
-            if err.kind() == ErrorKind::UnexpectedEof {
-                info!("Remote closed the connection");
-                return Ok(());
-            } else {
-                return Err(err);
+    async fn pause_sockets(self: &mut Self) {
+        self.control_channel.0.send(true).unwrap();
+        self.control_barrier.wait().await;
+    }
+
+    async fn resume_sockets(self: &mut Self) {
+        self.control_channel.0.send(false).unwrap();
+    }
+
+    /// Add a [`UsbDevice`] to the server.
+    /// This method will temporarily block all socket communication.
+    pub async fn add_device(self: &mut Self, device: &UsbDevice) {
+        self.pause_sockets().await;
+        self.devices.push(device.clone());
+        self.control_barrier = Barrier::new(self.devices.len() + 1);
+        self.resume_sockets().await;
+    }
+
+    /// Remove a [`UsbDevice`] from the server.
+    /// This method will temporarily block all socket communication.
+    pub async fn remove_device(self: &mut Self, device: &UsbDevice) {
+        self.pause_sockets().await;
+        self.devices.retain(|d| d.bus_id != device.bus_id);
+        self.control_barrier = Barrier::new(self.devices.len() + 1);
+        self.resume_sockets().await;
+    }
+
+    /// Start a loop that will handle communication for a single socket.
+    /// 
+    /// Returns `Ok(())` if the socket was closed by the remote, or an error otherwise.
+    /// 
+    /// This method will be blocked whenever [`UsbIpServer::add_device`] or [`UsbIpServer::remove_device`] is called.
+    /// 
+    /// See [`server`] for example usage.
+    pub async fn handler<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        self: &Self,
+        mut socket: &mut S,
+    ) -> Result<()> {
+        let mut current_import_device = None;
+        loop {
+            let should_stop_for_control = self.control_channel.1.borrow().clone();
+            if should_stop_for_control {
+                self.control_barrier.wait().await;
+                self.control_channel.1.clone().wait_for(|&b| !b).await.unwrap();
             }
-        }
-        match command {
-            [0x01, 0x11, 0x80, 0x05] => {
-                trace!("Got OP_REQ_DEVLIST");
-                let _status = socket.read_u32().await?;
 
-                // OP_REP_DEVLIST
-                socket.write_u32(0x01110005).await?;
-                socket.write_u32(0).await?;
-                socket.write_u32(server.devices.len() as u32).await?;
-                for dev in &server.devices {
-                    dev.write_dev_with_interfaces(&mut socket).await?;
+            let mut command = [0u8; 4];
+            if let Err(err) = socket.read_exact(&mut command).await {
+                if err.kind() == ErrorKind::UnexpectedEof {
+                    info!("Remote closed the connection");
+                    return Ok(());
+                } else {
+                    return Err(err);
                 }
-                trace!("Sent OP_REP_DEVLIST");
             }
-            [0x01, 0x11, 0x80, 0x03] => {
-                trace!("Got OP_REQ_IMPORT");
-                let _status = socket.read_u32().await?;
-                let mut bus_id = [0u8; 32];
-                socket.read_exact(&mut bus_id).await?;
-                current_import_device = None;
-                for device in &server.devices {
-                    let mut expected = device.bus_id.as_bytes().to_vec();
-                    expected.resize(32, 0);
-                    if expected == bus_id {
-                        current_import_device = Some(device);
-                        info!("Found device {:?}", device.path);
-                        break;
+            match command {
+                [0x01, 0x11, 0x80, 0x05] => {
+                    trace!("Got OP_REQ_DEVLIST");
+                    let _status = socket.read_u32().await?;
+
+                    // OP_REP_DEVLIST
+                    socket.write_u32(0x01110005).await?;
+                    socket.write_u32(0).await?;
+                    socket.write_u32(self.devices.len() as u32).await?;
+                    for dev in &self.devices {
+                        dev.write_dev_with_interfaces(&mut socket).await?;
+                    }
+                    trace!("Sent OP_REP_DEVLIST");
+                }
+                [0x01, 0x11, 0x80, 0x03] => {
+                    trace!("Got OP_REQ_IMPORT");
+                    let _status = socket.read_u32().await?;
+                    let mut bus_id = [0u8; 32];
+                    socket.read_exact(&mut bus_id).await?;
+                    current_import_device = None;
+                    for device in &self.devices {
+                        let mut expected = device.bus_id.as_bytes().to_vec();
+                        expected.resize(32, 0);
+                        if expected == bus_id {
+                            current_import_device = Some(device);
+                            info!("Found device {:?}", device.path);
+                            break;
+                        }
+                    }
+
+                    // OP_REP_IMPORT
+                    trace!("Sent OP_REP_IMPORT");
+                    socket.write_u32(0x01110003).await?;
+                    if let Some(dev) = current_import_device {
+                        socket.write_u32(0).await?;
+                        dev.write_dev(&mut socket).await?;
+                    } else {
+                        socket.write_u32(1).await?;
                     }
                 }
+                [0x00, 0x00, 0x00, 0x01] => {
+                    trace!("Got USBIP_CMD_SUBMIT");
+                    let seq_num = socket.read_u32().await?;
+                    let _dev_id = socket.read_u32().await?;
+                    let direction = socket.read_u32().await?;
+                    let ep = socket.read_u32().await?;
+                    let _transfer_flags = socket.read_u32().await?;
+                    let transfer_buffer_length = socket.read_u32().await?;
+                    let _start_frame = socket.read_u32().await?;
+                    let _number_of_packets = socket.read_u32().await?;
+                    let _interval = socket.read_u32().await?;
+                    let mut setup = [0u8; 8];
+                    socket.read_exact(&mut setup).await?;
+                    let device = current_import_device.unwrap();
 
-                // OP_REP_IMPORT
-                trace!("Sent OP_REP_IMPORT");
-                socket.write_u32(0x01110003).await?;
-                if let Some(dev) = current_import_device {
+                    let out = direction == 0;
+                    let real_ep = if out { ep } else { ep | 0x80 };
+                    // read request data from socket for OUT
+                    let out_data = if out {
+                        let mut data = vec![0u8; transfer_buffer_length as usize];
+                        socket.read_exact(&mut data).await?;
+                        data
+                    } else {
+                        vec![]
+                    };
+
+                    let (usb_ep, intf) = device.find_ep(real_ep as u8).unwrap();
+                    trace!("->Endpoint {:02x?}", usb_ep);
+                    trace!("->Setup {:02x?}", setup);
+                    trace!("->Request {:02x?}", out_data);
+                    let resp = device
+                        .handle_urb(usb_ep, intf, SetupPacket::parse(&setup), &out_data)
+                        .await?;
+
+                    if out {
+                        trace!("<-Resp {:02x?}", resp);
+                    } else {
+                        trace!("<-Wrote {}", out_data.len());
+                    }
+
+                    // USBIP_RET_SUBMIT
+                    // command
+                    socket.write_u32(0x3).await?;
+                    socket.write_u32(seq_num).await?;
                     socket.write_u32(0).await?;
-                    dev.write_dev(&mut socket).await?;
-                } else {
-                    socket.write_u32(1).await?;
+                    socket.write_u32(0).await?;
+                    socket.write_u32(0).await?;
+                    // status
+                    socket.write_u32(0).await?;
+
+                    let actual_length = if out {
+                        // In the out endpoint case, the actual_length field should be
+                        // same as the data length received in the original URB transaction.
+                        // No data bytes are sent
+                        transfer_buffer_length as u32
+                    } else {
+                        resp.len() as u32
+                    };
+                    // actual_length
+                    socket.write_u32(actual_length).await?;
+
+                    // start frame
+                    socket.write_u32(0).await?;
+                    // number of packets
+                    socket.write_u32(0).await?;
+                    // error count
+                    socket.write_u32(0).await?;
+                    // padding
+                    let padding = [0u8; 8];
+                    socket.write_all(&padding).await?;
+                    // data
+                    if !out {
+                        socket.write_all(&resp).await?;
+                    }
                 }
-            }
-            [0x00, 0x00, 0x00, 0x01] => {
-                trace!("Got USBIP_CMD_SUBMIT");
-                let seq_num = socket.read_u32().await?;
-                let _dev_id = socket.read_u32().await?;
-                let direction = socket.read_u32().await?;
-                let ep = socket.read_u32().await?;
-                let _transfer_flags = socket.read_u32().await?;
-                let transfer_buffer_length = socket.read_u32().await?;
-                let _start_frame = socket.read_u32().await?;
-                let _number_of_packets = socket.read_u32().await?;
-                let _interval = socket.read_u32().await?;
-                let mut setup = [0u8; 8];
-                socket.read_exact(&mut setup).await?;
-                let device = current_import_device.unwrap();
+                [0x00, 0x00, 0x00, 0x02] => {
+                    trace!("Got USBIP_CMD_UNLINK");
+                    let seq_num = socket.read_u32().await?;
+                    let _dev_id = socket.read_u32().await?;
+                    let _direction = socket.read_u32().await?;
+                    let _ep = socket.read_u32().await?;
+                    let _seq_num_submit = socket.read_u32().await?;
+                    // 24 bytes of struct padding
+                    let mut padding = [0u8; 6 * 4];
+                    socket.read_exact(&mut padding).await?;
 
-                let out = direction == 0;
-                let real_ep = if out { ep } else { ep | 0x80 };
-                // read request data from socket for OUT
-                let out_data = if out {
-                    let mut data = vec![0u8; transfer_buffer_length as usize];
-                    socket.read_exact(&mut data).await?;
-                    data
-                } else {
-                    vec![]
-                };
-
-                let (usb_ep, intf) = device.find_ep(real_ep as u8).unwrap();
-                trace!("->Endpoint {:02x?}", usb_ep);
-                trace!("->Setup {:02x?}", setup);
-                trace!("->Request {:02x?}", out_data);
-                let resp = device
-                    .handle_urb(usb_ep, intf, SetupPacket::parse(&setup), &out_data)
-                    .await?;
-
-                if out {
-                    trace!("<-Resp {:02x?}", resp);
-                } else {
-                    trace!("<-Wrote {}", out_data.len());
+                    // USBIP_RET_UNLINK
+                    // command
+                    socket.write_u32(0x4).await?;
+                    socket.write_u32(seq_num).await?;
+                    socket.write_u32(0).await?;
+                    socket.write_u32(0).await?;
+                    socket.write_u32(0).await?;
+                    // status
+                    socket.write_u32(0).await?;
+                    socket.write_all(&mut padding).await?;
                 }
-
-                // USBIP_RET_SUBMIT
-                // command
-                socket.write_u32(0x3).await?;
-                socket.write_u32(seq_num).await?;
-                socket.write_u32(0).await?;
-                socket.write_u32(0).await?;
-                socket.write_u32(0).await?;
-                // status
-                socket.write_u32(0).await?;
-
-                let actual_length = if out {
-                    // In the out endpoint case, the actual_length field should be
-                    // same as the data length received in the original URB transaction.
-                    // No data bytes are sent
-                    transfer_buffer_length as u32
-                } else {
-                    resp.len() as u32
-                };
-                // actual_length
-                socket.write_u32(actual_length).await?;
-
-                // start frame
-                socket.write_u32(0).await?;
-                // number of packets
-                socket.write_u32(0).await?;
-                // error count
-                socket.write_u32(0).await?;
-                // padding
-                let padding = [0u8; 8];
-                socket.write_all(&padding).await?;
-                // data
-                if !out {
-                    socket.write_all(&resp).await?;
-                }
+                _ => warn!("Got unknown command {:?}", command),
             }
-            [0x00, 0x00, 0x00, 0x02] => {
-                trace!("Got USBIP_CMD_UNLINK");
-                let seq_num = socket.read_u32().await?;
-                let _dev_id = socket.read_u32().await?;
-                let _direction = socket.read_u32().await?;
-                let _ep = socket.read_u32().await?;
-                let _seq_num_submit = socket.read_u32().await?;
-                // 24 bytes of struct padding
-                let mut padding = [0u8; 6 * 4];
-                socket.read_exact(&mut padding).await?;
-
-                // USBIP_RET_UNLINK
-                // command
-                socket.write_u32(0x4).await?;
-                socket.write_u32(seq_num).await?;
-                socket.write_u32(0).await?;
-                socket.write_u32(0).await?;
-                socket.write_u32(0).await?;
-                // status
-                socket.write_u32(0).await?;
-                socket.write_all(&mut padding).await?;
-            }
-            _ => warn!("Got unknown command {:?}", command),
         }
     }
 }
@@ -375,7 +437,7 @@ pub async fn server(addr: SocketAddr, server: UsbIpServer) {
                     info!("Got connection from {:?}", socket.peer_addr());
                     let new_server = usbip_server.clone();
                     tokio::spawn(async move {
-                        let res = handler(&mut socket, new_server).await;
+                        let res = new_server.handler(&mut socket).await;
                         info!("Handler ended with {:?}", res);
                     });
                 }
@@ -396,11 +458,11 @@ mod test {
 
     #[tokio::test]
     async fn req_empty_devlist() {
-        let server = UsbIpServer { devices: vec![] };
+        let server: UsbIpServer = Default::default();
 
         // OP_REQ_DEVLIST
         let mut mock_socket = MockSocket::new(vec![0x01, 0x11, 0x80, 0x05, 0x00, 0x00, 0x00, 0x00]);
-        handler(&mut mock_socket, Arc::new(server)).await.ok();
+        server.handler(&mut mock_socket).await.ok();
         // OP_REP_DEVLIST
         assert_eq!(
             mock_socket.output,
@@ -422,11 +484,12 @@ mod test {
                 cdc::UsbCdcAcmHandler::endpoints(),
                 intf_handler.clone(),
             )],
+            ..Default::default()
         };
 
         // OP_REQ_DEVLIST
         let mut mock_socket = MockSocket::new(vec![0x01, 0x11, 0x80, 0x05, 0x00, 0x00, 0x00, 0x00]);
-        handler(&mut mock_socket, Arc::new(server)).await.ok();
+        server.handler(&mut mock_socket).await.ok();
         // OP_REP_DEVLIST
         // header: 0xC
         // device: 0x138
@@ -448,6 +511,7 @@ mod test {
                 cdc::UsbCdcAcmHandler::endpoints(),
                 intf_handler.clone(),
             )],
+            ..Default::default()
         };
 
         // OP_REQ_IMPORT
@@ -456,7 +520,7 @@ mod test {
         path.resize(32, 0);
         req.extend(path);
         let mut mock_socket = MockSocket::new(req);
-        handler(&mut mock_socket, Arc::new(server)).await.ok();
+        server.handler(&mut mock_socket).await.ok();
         // OP_REQ_IMPORT
         assert_eq!(mock_socket.output.len(), 0x140);
     }
@@ -475,6 +539,7 @@ mod test {
                 cdc::UsbCdcAcmHandler::endpoints(),
                 intf_handler.clone(),
             )],
+            ..Default::default()
         };
 
         // OP_REQ_IMPORT
@@ -497,7 +562,7 @@ mod test {
             0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x40, 0x00, // GetDescriptor to Device
         ]);
         let mut mock_socket = MockSocket::new(req);
-        handler(&mut mock_socket, Arc::new(server)).await.ok();
+        server.handler(&mut mock_socket).await.ok();
         // OP_REQ_IMPORT + USBIP_CMD_SUBMIT + Device Descriptor
         assert_eq!(mock_socket.output.len(), 0x140 + 0x30 + 0x12);
     }
