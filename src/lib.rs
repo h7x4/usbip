@@ -14,6 +14,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 pub mod cdc;
 mod consts;
 mod device;
