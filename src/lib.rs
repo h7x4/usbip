@@ -517,6 +517,7 @@ mod test {
 
     #[tokio::test]
     async fn req_empty_devlist() {
+        setup_test_logger();
         let server = UsbIpServer::new_simulated(vec![]);
 
         // OP_REQ_DEVLIST
@@ -531,6 +532,7 @@ mod test {
 
     #[tokio::test]
     async fn req_sample_devlist() {
+        setup_test_logger();
         let server = new_server_with_single_device();
         // OP_REQ_DEVLIST
         let mut mock_socket = MockSocket::new(vec![0x01, 0x11, 0x80, 0x05, 0x00, 0x00, 0x00, 0x00]);
@@ -544,6 +546,7 @@ mod test {
 
     #[tokio::test]
     async fn req_import() {
+        setup_test_logger();
         let server = new_server_with_single_device();
 
         // OP_REQ_IMPORT
@@ -556,6 +559,7 @@ mod test {
 
     #[tokio::test]
     async fn add_and_remove_10_devices() {
+        setup_test_logger();
         let server_ = Arc::new(UsbIpServer::new_simulated(vec![]));
         let addr = get_free_address().await;
         tokio::spawn(server(addr, server_.clone()));
@@ -588,6 +592,7 @@ mod test {
 
     #[tokio::test]
     async fn send_usb_traffic_while_adding_and_removing_devices() {
+        setup_test_logger();
         let server_ = Arc::new(new_server_with_single_device());
 
         let addr = get_free_address().await;
@@ -655,6 +660,7 @@ mod test {
 
     #[tokio::test]
     async fn only_single_connection_allowed_to_device() {
+        setup_test_logger();
         let server_ = Arc::new(new_server_with_single_device());
 
         let addr = get_free_address().await;
@@ -672,6 +678,7 @@ mod test {
 
     #[tokio::test]
     async fn device_gets_released_on_cmd_unlink() {
+        setup_test_logger();
         let server_ = Arc::new(new_server_with_single_device());
 
         let addr = get_free_address().await;
@@ -708,6 +715,7 @@ mod test {
 
     #[tokio::test]
     async fn device_gets_released_on_closed_socket() {
+        setup_test_logger();
         let server_ = Arc::new(new_server_with_single_device());
 
         let addr = get_free_address().await;
@@ -726,6 +734,7 @@ mod test {
 
     #[tokio::test]
     async fn req_import_get_device_desc() {
+        setup_test_logger();
         let server = new_server_with_single_device();
 
         // OP_REQ_IMPORT
