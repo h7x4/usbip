@@ -1,4 +1,4 @@
-use super::*;
+
 
 /// Parse the SETUP packet of control transfers
 #[derive(Clone, Copy, Debug, Default)]
