@@ -1,0 +1,62 @@
+# Changelog
+
+## 0.7.0
+
+- Correct Standard Request Codes (#22)
+- Add support for editing device strings (#21)
+- Add support for modifying device list during execution (#18)
+- Add `transfer_buffer_length` to `handle_urb` (#26)
+- Handle `SET_IDLE` for HID devices (#28)
+- Fix crash on missing device descriptors (#32)
+- Set up logging for tests (#31)
+- Add API for de/serialization of USBIP packets (#31)
+- Add support for serde de/serialization for most structs (#19) (#35)
+- Update CI (#29)
+
+## 0.6.0
+
+- Bump dependency versions
+- Create
+
+## 0.5.0
+
+- Update rust edition to 2021
+- Reexport `Direction` from [a1ien/rusb][github-a1ien-rusb] (#4)
+- Bump dependency versions
+
+## 0.4.0
+
+- Fix crash when device doesn't have write permission (#1)
+- Fix crash on invalid interface number (#2)
+- Bump dependency versions
+
+## 0.3.1
+
+- Fix tests for `AsyncRead`
+
+## 0.3.0
+
+- Bump dependency versions
+
+## 0.2.1
+
+- Change log level of several log messages from `debug` to `trace`.
+- Handle `USBIP_CMD_UNLINK`
+
+## 0.2.0
+
+- Handle certain device descriptors internally
+- Add example and support for enumeration and binding of local devices using [a1ien/rusb][github-a1ien-rusb].
+- Add new helper methods to reduce boilerplate when creating `UsbIpServer`
+    structs, with and without local devices.
+- Add a few tests
+- Setup CI
+
+## 0.1.0
+
+- Initialize project
+
+
+<!-- Reference list -->
+
+[github-a1ien-rusb]: https://github.com/a1ien/rusb
